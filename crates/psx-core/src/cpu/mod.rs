@@ -7,7 +7,8 @@ use crate::bus::{Bus, BusError, GpuBackend, Segment, decode_virtual_addr};
 use crate::gte::Gte;
 use alloc::boxed::Box;
 use alloc::vec;
-use serde::{Deserialize, Serialize};
+use alloc::vec::Vec;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const ICACHE_LINES: usize = 256;
 
@@ -17,12 +18,39 @@ pub(crate) struct PendingLoad {
     pub val: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+fn alloc_boxed_u32<const N: usize>() -> Box<[u32; N]> {
+    match vec![0u32; N].into_boxed_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => unreachable!("allocated slice length always matches N"),
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ICache {
     /// Upper tag `[31:12]` | valid bitmask in bits `[3:0]` (1 bit per word in the 4-word line).
-    tags: Box<[u32]>,
+    tags: Box<[u32; ICACHE_LINES]>,
     /// `256 * 4 = 1024` cached 32-bit instruction words (`4 KB` total).
-    words: Box<[u32]>,
+    words: Box<[u32; ICACHE_LINES * 4]>,
+}
+
+impl Serialize for ICache {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.tags.as_slice(), self.words.as_slice()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ICache {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (tags_vec, words_vec): (Vec<u32>, Vec<u32>) = Deserialize::deserialize(deserializer)?;
+        let mut cache = Self::new();
+        if tags_vec.len() == ICACHE_LINES {
+            cache.tags.copy_from_slice(&tags_vec);
+        }
+        if words_vec.len() == ICACHE_LINES * 4 {
+            cache.words.copy_from_slice(&words_vec);
+        }
+        Ok(cache)
+    }
 }
 
 impl Default for ICache {
@@ -34,8 +62,8 @@ impl Default for ICache {
 impl ICache {
     fn new() -> Self {
         Self {
-            tags: vec![0u32; ICACHE_LINES].into_boxed_slice(),
-            words: vec![0u32; ICACHE_LINES * 4].into_boxed_slice(),
+            tags: alloc_boxed_u32::<ICACHE_LINES>(),
+            words: alloc_boxed_u32::<{ ICACHE_LINES * 4 }>(),
         }
     }
 
@@ -72,6 +100,13 @@ pub struct Cpu {
     pub(crate) branch_taken: bool,
     pub(crate) next_branch_taken: bool,
 
+    /// Previous `SR` held for 1 instruction after `MTC0 SR` (R3000A IRQ enable/mask hazard).
+    pub(crate) sr_irq_delay: Option<u32>,
+
+    /// Monotonic CPU cycle counter and GTE (`COP2`) completion timestamp for hardware busy-stalls.
+    pub(crate) cycle_count: u64,
+    pub(crate) gte_busy_until: u64,
+
     icache: ICache,
 }
 
@@ -100,6 +135,9 @@ impl Cpu {
             next_is_branch: false,
             branch_taken: false,
             next_branch_taken: false,
+            sr_irq_delay: None,
+            cycle_count: 0,
+            gte_busy_until: 0,
             icache: ICache::new(),
         }
     }
@@ -188,6 +226,7 @@ impl Cpu {
         self.next_is_branch = false;
         self.branch_taken = false;
         self.next_branch_taken = false;
+        self.sr_irq_delay = None;
         self.regs[0] = 0;
     }
 
@@ -212,7 +251,7 @@ impl Cpu {
             let entry_tag = self.icache.tags[line];
 
             if (entry_tag & 0xFFFF_F000) == tag && (entry_tag & valid_bit) != 0 {
-                return Ok((self.icache.words[line * 4 + word_idx], 1));
+                return Ok((self.icache.words[(line << 2) | word_idx], 1));
             }
 
             // I-Cache miss: refill from `word_idx..4` to end of 16-byte cache line
@@ -225,12 +264,12 @@ impl Cpu {
             let mut total_cycles = 2u64;
             for w in word_idx..4 {
                 let (word, c) = bus.read32(base_vaddr + (w as u32) * 4)?;
-                self.icache.words[line * 4 + w] = word;
+                self.icache.words[(line << 2) | w] = word;
                 valid_mask |= 1u32 << w;
                 total_cycles += if w == word_idx { c } else { 1 };
             }
             self.icache.tags[line] = tag | valid_mask;
-            return Ok((self.icache.words[line * 4 + word_idx], total_cycles));
+            return Ok((self.icache.words[(line << 2) | word_idx], total_cycles));
         }
 
         bus.read32(vaddr)
@@ -254,7 +293,21 @@ impl Cpu {
         }
     }
 
+    /// Computes hardware R3000A COP2 stall cycles if GTE is still busy when a `COP2`
+    /// instruction reaches EX stage (`t_ex`). Hardware incurs `(busy_until - t_ex) + 1`
+    /// stall cycles when busy, and `0` stall cycles when `t_ex >= busy_until`.
+    #[inline(always)]
+    pub(crate) fn stall_for_gte(&self, fetch_cycles: u64) -> u64 {
+        let t_ex = self.cycle_count.saturating_add(fetch_cycles.saturating_sub(1));
+        if t_ex < self.gte_busy_until {
+            (self.gte_busy_until - t_ex) + 1
+        } else {
+            0
+        }
+    }
+
     /// Executes a single R3000A instruction and returns elapsed master clock cycles.
+    #[inline]
     pub fn step_instruction<G: GpuBackend>(&mut self, bus: &mut Bus<G>) -> u64 {
         debug_assert_eq!(self.regs[0], 0, "$zero invariant violated before step");
 
@@ -268,39 +321,50 @@ impl Cpu {
         self.next_is_branch = false;
         self.next_branch_taken = false;
 
-        // 2. Sample hardware & software interrupts synchronously
-        if self.cop0.sync_irq_and_check(bus.irq_pending()) {
-            self.raise_exception(ExceptionCode::Interrupt, 0, false);
-            debug_assert_eq!(self.regs[0], 0);
-            return 1;
+        // 2. Sample hardware & software interrupts synchronously (respecting 1-insn MTC0 SR hazard)
+        let hw_irq = bus.irq_pending();
+        if hw_irq || self.sr_irq_delay.is_some() || (self.cop0.cause & 0x0700) != 0 {
+            let effective_sr = self.sr_irq_delay.take().unwrap_or(self.cop0.sr);
+            if self.cop0.sync_irq_and_check(hw_irq, effective_sr) {
+                self.raise_exception(ExceptionCode::Interrupt, 0, false);
+                self.cycle_count = self.cycle_count.saturating_add(1);
+                debug_assert_eq!(self.regs[0], 0);
+                return 1;
+            }
         }
 
-        // 3. Check PC alignment and User-Mode segment protection (`KSEG*` >= 0x8000_0000)
-        if (self.current_pc & 3) != 0
-            || (self.cop0.is_user_mode() && self.current_pc >= 0x8000_0000)
-        {
+        // 3. Check PC alignment / User-Mode protection and hardware COP0 `BPC` breakpoint.
+        // `BPC` comparator latches `DCIC` status bits in parallel even if `AdEL` wins trap priority.
+        let pc_addr_err = (self.current_pc & 3) != 0
+            || (self.cop0.is_user_mode() && self.current_pc >= 0x8000_0000);
+        let bpc_trap = self.cop0.check_exec_breakpoint(self.current_pc);
+
+        if pc_addr_err {
             self.cop0.bad_vaddr = self.current_pc;
             self.raise_exception(ExceptionCode::AddressErrorLoad, 0, false);
+            self.cycle_count = self.cycle_count.saturating_add(1);
             debug_assert_eq!(self.regs[0], 0);
             return 1;
         }
 
-        // 4. Check hardware COP0 `BPC` execution breakpoint
-        if self.cop0.check_exec_breakpoint(self.current_pc) {
+        if bpc_trap {
             self.raise_exception(ExceptionCode::Breakpoint, 0, true);
+            self.cycle_count = self.cycle_count.saturating_add(1);
             debug_assert_eq!(self.regs[0], 0);
             return 1;
         }
 
         // 5. Fetch instruction word
-        let (instr, mut cycles) = match self.fetch_instruction(bus, self.current_pc) {
+        let (instr, fetch_cycles) = match self.fetch_instruction(bus, self.current_pc) {
             Ok(res) => res,
             Err(_) => {
                 self.raise_exception(ExceptionCode::InstructionBusError, 0, false);
+                self.cycle_count = self.cycle_count.saturating_add(4);
                 debug_assert_eq!(self.regs[0], 0);
                 return 4;
             }
         };
+        let mut cycles = fetch_cycles;
         self.last_opcode = instr;
 
         // Advance PC pipeline before decoding
@@ -308,7 +372,7 @@ impl Cpu {
         self.next_pc = self.next_pc.wrapping_add(4);
 
         // 6. Decode and execute instruction
-        cycles += self.decode_and_execute(instr, bus);
+        cycles += self.decode_and_execute(instr, fetch_cycles, bus);
 
         // 7. Commit `in_flight_load` unless canceled by delay-slot overwrite or exception
         if self.in_flight_load.reg != 0 {
@@ -317,6 +381,7 @@ impl Cpu {
         }
 
         self.regs[0] = 0;
+        self.cycle_count = self.cycle_count.saturating_add(cycles);
         debug_assert_eq!(self.regs[0], 0, "$zero invariant violated after step");
         cycles
     }

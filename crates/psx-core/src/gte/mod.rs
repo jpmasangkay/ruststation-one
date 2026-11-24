@@ -143,15 +143,14 @@ impl Gte {
     }
 
     #[inline(always)]
-    fn set_mac0(&mut self, val: i64) -> i32 {
+    fn set_mac0(&mut self, val: i64) -> i64 {
         if val > 0x7FFF_FFFF {
             self.set_flag_bit(16);
         } else if val < -0x8000_0000 {
             self.set_flag_bit(15);
         }
-        let m0 = val as i32;
-        self.data_regs[24] = m0 as u32;
-        m0
+        self.data_regs[24] = (val as i32) as u32;
+        val
     }
 
     /// Checks 44-bit signed accumulator bounds on `idx` (`1..=3`), sets `FLAG` bits `30..25`,
@@ -193,17 +192,17 @@ impl Gte {
     }
 
     #[inline(always)]
-    fn set_ir0(&mut self, val: i32) {
+    fn set_ir0(&mut self, val: i64) {
         let clamped = if val < 0 {
             self.set_flag_bit(12);
-            0
+            0i16
         } else if val > 0x1000 {
             self.set_flag_bit(12);
-            0x1000
+            0x1000i16
         } else {
-            val
+            val as i16
         };
-        self.data_regs[8] = (clamped as i16) as i32 as u32;
+        self.data_regs[8] = (clamped as i32) as u32;
     }
 
     #[inline(always)]
@@ -239,7 +238,7 @@ impl Gte {
     }
 
     #[inline(always)]
-    fn push_sxy(&mut self, sx_raw: i32, sy_raw: i32) {
+    fn push_sxy(&mut self, sx_raw: i64, sy_raw: i64) {
         let sx = if sx_raw < -0x400 {
             self.set_flag_bit(14);
             -0x400i16
@@ -374,6 +373,7 @@ impl Gte {
     // Main GTE Opcode Execution Entrypoint (`COP2 imm25`)
     // ========================================================================
 
+    #[inline(never)]
     pub fn execute(&mut self, instr: u32) -> u64 {
         // Clear FLAG at the beginning of every GTE command
         self.ctrl_regs[31] = 0;
@@ -915,5 +915,45 @@ mod tests {
         let cmd_mx3 = (3 << 17) | (3 << 13) | 0x12;
         gte.execute(cmd_mx3);
         assert_eq!(gte.read_data(25) as i32, 125_440);
+    }
+
+    #[test]
+    fn rtps_clamps_64bit_mac0_overflow_into_sxy2_and_ir0_before_32bit_truncation() {
+        let mut gte = Gte::new();
+        // Identity RT, TRZ = 0 -> SZ3 = 0 -> UNR divide overflows to q = 0x1_FFFF!
+        gte.write_ctrl(0, 0x0000_1000);
+        gte.write_ctrl(2, 0x0000_1000);
+        gte.write_ctrl(4, 0x0000_1000);
+        gte.write_ctrl(24, 0x7FFF_FFFF); // OFX = +i32::MAX
+        gte.write_ctrl(25, 0x7FFF_FFFF); // OFY = +i32::MAX
+        gte.write_ctrl(26, 0xFFFF); // H = 65535 -> div overflow q = 0x1_FFFF
+        gte.write_ctrl(27, 0x7FFF); // DQA = +32767
+        gte.write_ctrl(28, 0x7FFF_FFFF); // DQB = +i32::MAX -> DQB + DQA*q > i32::MAX!
+
+        // V0 = (+0x7FFF, +0x7FFF, 0) -> IR1 = IR2 = +0x7FFF -> q*IR1 + OFX overflows i32 positive!
+        gte.write_data(0, 0x7FFF_7FFF);
+        gte.write_data(1, 0);
+
+        gte.execute((1 << 19) | 0x01); // RTPS sf=1
+
+        let sxy2 = gte.read_data(14);
+        assert_eq!(sxy2 as i16, 0x03FF, "SX2 must saturate positive, not wrap");
+        assert_eq!(
+            (sxy2 >> 16) as i16,
+            0x03FF,
+            "SY2 must saturate positive, not wrap"
+        );
+        assert_eq!(
+            gte.read_data(8) as i32,
+            0x1000,
+            "IR0 must saturate to +0x1000 on positive 64-bit MAC0 overflow"
+        );
+        let flag = gte.read_ctrl(31);
+        assert_ne!(flag & (1 << 17), 0, "DIV overflow bit 17 must be set");
+        assert_ne!(flag & (1 << 16), 0, "MAC0+ overflow bit 16 must be set");
+        assert_ne!(flag & (1 << 14), 0, "SX2 sat bit 14 must be set");
+        assert_ne!(flag & (1 << 13), 0, "SY2 sat bit 13 must be set");
+        assert_ne!(flag & (1 << 12), 0, "IR0 sat bit 12 must be set");
+        assert_ne!(flag & (1 << 31), 0, "Error summary bit 31 must be set");
     }
 }

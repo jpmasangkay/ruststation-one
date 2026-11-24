@@ -5,6 +5,7 @@ use crate::scheduler::{
     EventKind, EventScheduler, MAX_CPU_SLICE_CYCLES, NTSC_CYCLES_PER_FRAME,
     NTSC_CYCLES_PER_SCANLINE, ScheduledEvent,
 };
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -111,6 +112,7 @@ pub struct System<G: GpuBackend = NullGpu> {
     pub scheduler: EventScheduler,
     scanline: u16,
     pending_exe: Option<PsxExe>,
+    exe_args: Vec<String>,
     exe_sideloaded: bool,
     trace: TraceRingBuffer,
 }
@@ -133,6 +135,7 @@ impl<G: GpuBackend> System<G> {
             scheduler,
             scanline: 0,
             pending_exe: None,
+            exe_args: Vec::new(),
             exe_sideloaded: false,
             trace: TraceRingBuffer::with_capacity(0),
         }
@@ -164,6 +167,38 @@ impl<G: GpuBackend> System<G> {
     pub fn set_sideload_exe(&mut self, exe: PsxExe) {
         self.pending_exe = Some(exe);
         self.exe_sideloaded = false;
+    }
+
+    /// Configures optional PS-X loader command-line arguments written into Scratchpad (`0x1F80_0000`)
+    /// when a `PS-X EXE` is loaded (up to 15 arguments, 256 bytes total string pool).
+    pub fn set_exe_args(&mut self, args: Vec<String>) {
+        self.exe_args = args;
+    }
+
+    /// Writes `exe_args` into Scratchpad (`0x1F80_0000`: `u32 argc`, `0x1F80_0004`: `u32 argv[15]`,
+    /// `0x1F80_0044..0x1F80_0144`: NUL-terminated ASCII strings).
+    fn write_scratchpad_args(&mut self) {
+        if self.exe_args.is_empty() {
+            return;
+        }
+        let sp = self.bus.scratchpad_mut();
+        sp[0..0x144].fill(0);
+        let mut argc = 0u32;
+        let mut str_off = 0x44usize;
+        for arg in self.exe_args.iter().take(15) {
+            let bytes = arg.as_bytes();
+            if str_off + bytes.len() + 1 > 0x144 {
+                break;
+            }
+            let ptr = 0x1F80_0000u32 | (str_off as u32);
+            let slot = 4 + (argc as usize) * 4;
+            sp[slot..slot + 4].copy_from_slice(&ptr.to_le_bytes());
+            sp[str_off..str_off + bytes.len()].copy_from_slice(bytes);
+            sp[str_off + bytes.len()] = 0;
+            str_off += bytes.len() + 1;
+            argc += 1;
+        }
+        sp[0..4].copy_from_slice(&argc.to_le_bytes());
     }
 
     /// Applies a `PS-X EXE` immediately into Main RAM and CPU registers (used both by the
@@ -199,6 +234,7 @@ impl<G: GpuBackend> System<G> {
             self.cpu.regs[30] = sp; // $fp
         }
         self.cpu.regs[0] = 0;
+        self.write_scratchpad_args();
         self.exe_sideloaded = true;
     }
 
@@ -233,16 +269,18 @@ impl<G: GpuBackend> System<G> {
         stop_at_shell: bool,
         tty: &mut T,
     ) -> StepStopReason {
+        let trace_enabled = self.trace.is_enabled();
         while self.scheduler.now() < max_cycle {
             let slice_limit = self
                 .scheduler
                 .next_event_cycle()
                 .min(max_cycle)
                 .min(self.scheduler.now().saturating_add(MAX_CPU_SLICE_CYCLES));
+            let check_shell = self.pending_exe.is_some() || stop_at_shell;
 
             while self.scheduler.now() < slice_limit {
                 // 1. Check BIOS shell hook (`0x8003_0000`) BEFORE executing shell instruction
-                if self.cpu.pc == BIOS_SHELL_ENTRY_PC {
+                if check_shell && self.cpu.pc == BIOS_SHELL_ENTRY_PC {
                     if let Some(exe) = self.pending_exe.take() {
                         self.apply_exe_now(&exe);
                     } else if stop_at_shell {
@@ -251,11 +289,13 @@ impl<G: GpuBackend> System<G> {
                 }
 
                 // 2. Intercept BIOS `putchar` syscalls: A0(0x3C) and B0(0x3D)
-                let phys_pc = self.cpu.pc & 0x1FFF_FFFF;
-                if (phys_pc == 0x0000_00B0 && self.cpu.regs[9] == 0x3D)
-                    || (phys_pc == 0x0000_00A0 && self.cpu.regs[9] == 0x3C)
-                {
-                    tty.on_tty_byte(self.cpu.regs[4] as u8);
+                if (self.cpu.pc & 0x1FFF_FFEF) == 0x0000_00A0 {
+                    let phys_pc = self.cpu.pc & 0x1FFF_FFFF;
+                    if (phys_pc == 0x0000_00B0 && self.cpu.regs[9] == 0x3D)
+                        || (phys_pc == 0x0000_00A0 && self.cpu.regs[9] == 0x3C)
+                    {
+                        tty.on_tty_byte(self.cpu.regs[4] as u8);
+                    }
                 }
 
                 let step_cycle = self.scheduler.now();
@@ -265,7 +305,11 @@ impl<G: GpuBackend> System<G> {
                 let elapsed = self.cpu.step_instruction(&mut self.bus);
                 self.scheduler.advance(elapsed);
 
-                if self.trace.is_enabled() {
+                if self.bus.take_sio0_irq_request() {
+                    self.scheduler.schedule(300, EventKind::Sio0AckIrq);
+                }
+
+                if trace_enabled {
                     self.trace.push(TraceEntry {
                         cycle: step_cycle,
                         pc: step_pc,
@@ -277,10 +321,12 @@ impl<G: GpuBackend> System<G> {
                     });
                 }
 
-                // 3. Forward any Expansion 2 DUART / debug console bytes
-                let (exp2_bytes, exp2_len) = self.bus.drain_exp2_tty();
-                for &b in &exp2_bytes[..exp2_len] {
-                    tty.on_tty_byte(b);
+                // 3. Forward any Expansion 2 DUART / debug console bytes (fast-path skip when empty)
+                if self.bus.has_exp2_tty() {
+                    let (exp2_bytes, exp2_len) = self.bus.drain_exp2_tty();
+                    for &b in &exp2_bytes[..exp2_len] {
+                        tty.on_tty_byte(b);
+                    }
                 }
             }
 
@@ -311,6 +357,9 @@ impl<G: GpuBackend> System<G> {
                 self.bus.gpu.toggle_interlace_field();
                 self.scheduler
                     .schedule(NTSC_CYCLES_PER_FRAME, EventKind::VblankEdge);
+            }
+            EventKind::Sio0AckIrq => {
+                self.bus.latch_irq(7);
             }
             _ => {}
         }
@@ -376,5 +425,29 @@ mod tests {
         assert!(sys.exe_sideloaded());
         assert_eq!(tty_out, b"Hi");
         assert_eq!(sys.trace_entries().len(), 16);
+    }
+
+    #[test]
+    fn exe_args_populate_scratchpad_argc_and_argv_on_load() {
+        let mut sys = System::new_headless();
+        sys.set_exe_args(vec![String::from("console"), String::from("auto")]);
+
+        let mut raw_exe = vec![0u8; 0x804];
+        raw_exe[0..8].copy_from_slice(b"PS-X EXE");
+        raw_exe[0x10..0x14].copy_from_slice(&0x8001_0000u32.to_le_bytes());
+        raw_exe[0x18..0x1C].copy_from_slice(&0x8001_0000u32.to_le_bytes());
+        raw_exe[0x1C..0x20].copy_from_slice(&4u32.to_le_bytes());
+
+        let exe = PsxExe::parse(&raw_exe).unwrap();
+        sys.apply_exe_now(&exe);
+
+        let sp = sys.bus.scratchpad();
+        assert_eq!(u32::from_le_bytes([sp[0], sp[1], sp[2], sp[3]]), 2);
+        let argv0 = u32::from_le_bytes([sp[4], sp[5], sp[6], sp[7]]);
+        let argv1 = u32::from_le_bytes([sp[8], sp[9], sp[10], sp[11]]);
+        assert_eq!(argv0, 0x1F80_0044);
+        assert_eq!(argv1, 0x1F80_004C);
+        assert_eq!(&sp[0x44..0x4C], b"console\0");
+        assert_eq!(&sp[0x4C..0x51], b"auto\0");
     }
 }

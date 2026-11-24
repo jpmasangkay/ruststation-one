@@ -114,6 +114,14 @@ impl Cop0 {
         (self.sr & (1u32 << (28 + cop_num))) != 0
     }
 
+    /// Returns `true` for TLB-era COP0 register indices (`r0`, `r1`, `r2`, `r4`, `r10`) that do not
+    /// exist on PlayStation's CW33300 and raise `ReservedInstruction` on `MFC0`/`MTC0`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_reserved_reg(rd: u8) -> bool {
+        matches!(rd, 0 | 1 | 2 | 4 | 10)
+    }
+
     #[inline]
     #[must_use]
     pub const fn read_reg(&self, rd: u8) -> u32 {
@@ -157,25 +165,36 @@ impl Cop0 {
         self.sr = (self.sr & !0x3F) | shifted | preserved_outer;
     }
 
-    /// Updates hardware interrupt line `IP2` (`CAUSE` bit 10) and returns `true` if an interrupt should fire.
+    /// Updates hardware interrupt line `IP2` (`CAUSE` bit 10) and returns `true` if an interrupt should fire
+    /// using `effective_sr` (which lags `MTC0 SR` by 1 instruction on R3000A hardware).
     #[inline(always)]
-    pub fn sync_irq_and_check(&mut self, hw_irq_pending: bool) -> bool {
+    pub fn sync_irq_and_check(&mut self, hw_irq_pending: bool, effective_sr: u32) -> bool {
         if hw_irq_pending {
             self.cause |= 1 << 10;
         } else {
             self.cause &= !(1 << 10);
         }
-        let iec = (self.sr & 1) != 0;
-        iec && ((self.sr & self.cause & 0xFF00) != 0)
+        let iec = (effective_sr & 1) != 0;
+        iec && ((effective_sr & self.cause & 0xFF00) != 0)
     }
 
     /// Checks hardware PC execution breakpoint (`BPC` / `BPCM` under `DCIC` enables).
-    /// Returns `true` if a debug breakpoint trap to `0x8000_0040` / `0xBFC0_0140` triggered.
-    #[inline]
+    /// Latches `DCIC` status bits `[1:0]` whenever enabled and matched (even if `TR` bit 31 is 0).
+    /// Returns `true` if a debug breakpoint trap to `0x8000_0040` / `0xBFC0_0140` should fire.
+    #[inline(always)]
     pub fn check_exec_breakpoint(&mut self, pc: u32) -> bool {
-        // Super-master bit 23 (DE), master bit 30, and PC-break bit 24 must all be enabled
-        const REQ: u32 = (1 << 23) | (1 << 24) | (1 << 30);
+        // Super-master bit 23 (DE) and PC-break bit 24 (PCE) must be enabled,
+        // plus address-region enable: bit 29 (KD) for >= 0x8000_0000, bit 30 (UD) for < 0x8000_0000.
+        const REQ: u32 = (1 << 23) | (1 << 24);
         if (self.dcic & REQ) != REQ {
+            return false;
+        }
+        let region_bit = if (pc & 0x8000_0000) != 0 {
+            1 << 29
+        } else {
+            1 << 30
+        };
+        if (self.dcic & region_bit) == 0 {
             return false;
         }
         if ((pc ^ self.bpc) & self.bpcm) == 0 {
@@ -186,17 +205,27 @@ impl Cop0 {
     }
 
     /// Checks hardware Data read/write breakpoint (`BDA` / `BDAM` under `DCIC` enables).
-    #[inline]
-    pub fn check_data_breakpoint(&mut self, vaddr: u32, is_write: bool) -> bool {
-        const REQ: u32 = (1 << 23) | (1 << 25) | (1 << 30);
+    /// Latches `DCIC` status bits `[4,2,0]` (write) or `[3,2,0]` (read) whenever enabled and matched.
+    /// Returns `true` if a debug breakpoint trap to `0x8000_0040` / `0xBFC0_0140` should fire.
+    #[inline(always)]
+    pub fn check_data_breakpoint(&mut self, bus_addr: u32, is_write: bool) -> bool {
+        const REQ: u32 = (1 << 23) | (1 << 25);
         if (self.dcic & REQ) != REQ {
+            return false;
+        }
+        let region_bit = if (bus_addr & 0x8000_0000) != 0 {
+            1 << 29
+        } else {
+            1 << 30
+        };
+        if (self.dcic & region_bit) == 0 {
             return false;
         }
         let dir_bit = if is_write { 1 << 27 } else { 1 << 26 };
         if (self.dcic & dir_bit) == 0 {
             return false;
         }
-        if ((vaddr ^ self.bda) & self.bdam) == 0 {
+        if ((bus_addr ^ self.bda) & self.bdam) == 0 {
             let status_dir = if is_write { 1 << 4 } else { 1 << 3 };
             self.dcic |= (1 << 0) | (1 << 2) | status_dir;
             return (self.dcic & (1 << 31)) != 0;

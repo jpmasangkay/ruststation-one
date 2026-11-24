@@ -7,6 +7,7 @@ impl Cpu {
     pub(crate) fn decode_and_execute<G: GpuBackend>(
         &mut self,
         instr: u32,
+        fetch_cycles: u64,
         bus: &mut Bus<G>,
     ) -> u64 {
         let op = instr >> 26;
@@ -67,7 +68,6 @@ impl Cpu {
                     self.next_pc = target;
                     self.next_is_branch = true;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                     0
                 }
                 0x09 => {
@@ -78,7 +78,6 @@ impl Cpu {
                     self.next_pc = target;
                     self.next_is_branch = true;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                     0
                 }
                 0x0C => {
@@ -256,7 +255,6 @@ impl Cpu {
                     let target = self.pc.wrapping_add(imm_s << 2);
                     self.next_pc = target;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                 }
                 0
             }
@@ -270,7 +268,6 @@ impl Cpu {
                 self.next_pc = target;
                 self.next_is_branch = true;
                 self.next_branch_taken = true;
-                self.cop0.jumpdest = target;
                 0
             }
             0x03 => {
@@ -281,7 +278,6 @@ impl Cpu {
                 self.next_pc = target;
                 self.next_is_branch = true;
                 self.next_branch_taken = true;
-                self.cop0.jumpdest = target;
                 0
             }
             0x04 => {
@@ -291,7 +287,6 @@ impl Cpu {
                     let target = self.pc.wrapping_add(imm_s << 2);
                     self.next_pc = target;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                 }
                 0
             }
@@ -302,7 +297,6 @@ impl Cpu {
                     let target = self.pc.wrapping_add(imm_s << 2);
                     self.next_pc = target;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                 }
                 0
             }
@@ -313,7 +307,6 @@ impl Cpu {
                     let target = self.pc.wrapping_add(imm_s << 2);
                     self.next_pc = target;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                 }
                 0
             }
@@ -324,7 +317,6 @@ impl Cpu {
                     let target = self.pc.wrapping_add(imm_s << 2);
                     self.next_pc = target;
                     self.next_branch_taken = true;
-                    self.cop0.jumpdest = target;
                 }
                 0
             }
@@ -395,13 +387,24 @@ impl Cpu {
                 match rs {
                     0x00 => {
                         // MFC0 rt, rd (1-instruction load delay!)
-                        let val = self.cop0.read_reg(rd);
-                        self.queue_load(rt, val);
+                        if crate::cpu::Cop0::is_reserved_reg(rd) {
+                            self.raise_exception(ExceptionCode::ReservedInstruction, 0, false);
+                        } else {
+                            let val = self.cop0.read_reg(rd);
+                            self.queue_load(rt, val);
+                        }
                     }
                     0x04 => {
-                        // MTC0 rt, rd
-                        let val = self.regs[rt as usize];
-                        self.cop0.write_reg(rd, val);
+                        // MTC0 rt, rd (writes to SR lag interrupt enable/mask by 1 instruction!)
+                        if crate::cpu::Cop0::is_reserved_reg(rd) {
+                            self.raise_exception(ExceptionCode::ReservedInstruction, 0, false);
+                        } else {
+                            let val = self.regs[rt as usize];
+                            if rd == 12 {
+                                self.sr_irq_delay = Some(self.cop0.sr);
+                            }
+                            self.cop0.write_reg(rd, val);
+                        }
                     }
                     0x10..=0x1F => {
                         if (instr & 0x3F) == 0x10 {
@@ -428,32 +431,46 @@ impl Cpu {
                 }
                 match rs {
                     0x00 => {
-                        // MFC2 rt, rd (1-instruction load delay!)
+                        // MFC2 rt, rd (1-instruction load delay; stalls if GTE is busy!)
+                        let stall = self.stall_for_gte(fetch_cycles);
                         let val = self.gte.read_data(rd);
                         self.queue_load(rt, val);
-                        0
+                        stall
                     }
                     0x02 => {
-                        // CFC2 rt, rd (1-instruction load delay!)
+                        // CFC2 rt, rd (1-instruction load delay; stalls if GTE is busy!)
+                        let stall = self.stall_for_gte(fetch_cycles);
                         let val = self.gte.read_ctrl(rd);
                         self.queue_load(rt, val);
-                        0
+                        stall
                     }
                     0x04 => {
-                        // MTC2 rt, rd
+                        // MTC2 rt, rd (stalls if GTE is busy)
+                        let stall = self.stall_for_gte(fetch_cycles);
                         let val = self.regs[rt as usize];
                         self.gte.write_data(rd, val);
-                        0
+                        stall
                     }
                     0x06 => {
-                        // CTC2 rt, rd
+                        // CTC2 rt, rd (stalls if GTE is busy)
+                        let stall = self.stall_for_gte(fetch_cycles);
                         let val = self.regs[rt as usize];
                         self.gte.write_ctrl(rd, val);
-                        0
+                        stall
                     }
-                    0x10..=0x1F => self.gte.execute(instr),
+                    0x10..=0x1F => {
+                        // GTE command executes asynchronously in parallel with CPU!
+                        let stall = self.stall_for_gte(fetch_cycles);
+                        let t_issue = self
+                            .cycle_count
+                            .saturating_add(fetch_cycles.saturating_sub(1))
+                            .saturating_add(stall);
+                        let latency = self.gte.execute(instr);
+                        self.gte_busy_until = t_issue.saturating_add(latency);
+                        stall
+                    }
                     _ => {
-                        self.raise_exception(ExceptionCode::ReservedInstruction, 0, false);
+                        self.raise_exception(ExceptionCode::ReservedInstruction, 2, false);
                         0
                     }
                 }
@@ -488,8 +505,9 @@ impl Cpu {
             }
             0x22 => {
                 // LWL rt, imm_s(rs) — unaligned MSB merge with load-delay bypass!
+                // On little-endian R3000A, LWL drives `vaddr & !3` onto the data bus (`BDA` sees aligned address).
                 let vaddr = self.regs[rs as usize].wrapping_add(imm_s);
-                self.exec_load(bus, vaddr, 1, |cpu, bus, addr| {
+                self.exec_load_bda(bus, vaddr, vaddr & !3, 1, |cpu, bus, addr| {
                     let (mem, c) = bus.read32(addr & !3)?;
                     let cur = cpu.read_reg_for_lwl_lwr(rt);
                     let merged = match addr & 3 {
@@ -563,9 +581,10 @@ impl Cpu {
             }
             0x2A => {
                 // SWL rt, imm_s(rs)
+                // On little-endian R3000A, SWL drives `vaddr & !3` onto the data bus (`BDA` sees aligned address).
                 let vaddr = self.regs[rs as usize].wrapping_add(imm_s);
                 let reg_val = self.regs[rt as usize];
-                self.exec_store(bus, vaddr, 1, |_cpu, bus, addr| {
+                self.exec_store_bda(bus, vaddr, vaddr & !3, 1, |_cpu, bus, addr| {
                     let aligned = addr & !3;
                     let (mem, rc) = bus.read32(aligned)?;
                     let merged = match addr & 3 {
@@ -613,11 +632,16 @@ impl Cpu {
                 }
                 let vaddr = self.regs[rs as usize].wrapping_add(imm_s);
                 self.exec_load(bus, vaddr, 4, |cpu, bus, addr| {
+                    let stall = if cop_num == 2 {
+                        cpu.stall_for_gte(fetch_cycles)
+                    } else {
+                        0
+                    };
                     let (word, c) = bus.read32(addr)?;
                     if cop_num == 2 {
                         cpu.gte.write_data(rt, word);
                     }
-                    Ok(c)
+                    Ok(stall + c)
                 })
             }
             0x38..=0x3B => {
@@ -627,16 +651,24 @@ impl Cpu {
                     return 0;
                 }
                 let vaddr = self.regs[rs as usize].wrapping_add(imm_s);
+                let stall = if cop_num == 2 {
+                    self.stall_for_gte(fetch_cycles)
+                } else {
+                    0
+                };
                 let val = if cop_num == 2 {
                     self.gte.read_data(rt)
                 } else {
                     0
                 };
-                self.exec_store(bus, vaddr, 4, |_cpu, bus, addr| bus.write32(addr, val))
+                self.exec_store(bus, vaddr, 4, |_cpu, bus, addr| {
+                    let c = bus.write32(addr, val)?;
+                    Ok(stall + c)
+                })
             }
 
             _ => {
-                self.raise_exception(ExceptionCode::ReservedInstruction, 0, false);
+                self.raise_exception(ExceptionCode::ReservedInstruction, (op & 3) as u8, false);
                 0
             }
         }
@@ -648,12 +680,32 @@ impl Cpu {
         G: GpuBackend,
         F: FnOnce(&mut Self, &mut Bus<G>, u32) -> Result<u64, crate::bus::BusError>,
     {
-        if (vaddr & (align - 1)) != 0 || (self.cop0.is_user_mode() && vaddr >= 0x8000_0000) {
+        self.exec_load_bda(bus, vaddr, vaddr, align, f)
+    }
+
+    #[inline]
+    fn exec_load_bda<G, F>(
+        &mut self,
+        bus: &mut Bus<G>,
+        vaddr: u32,
+        bda_addr: u32,
+        align: u32,
+        f: F,
+    ) -> u64
+    where
+        G: GpuBackend,
+        F: FnOnce(&mut Self, &mut Bus<G>, u32) -> Result<u64, crate::bus::BusError>,
+    {
+        let addr_err =
+            (vaddr & (align - 1)) != 0 || (self.cop0.is_user_mode() && vaddr >= 0x8000_0000);
+        let bp_trap = self.cop0.check_data_breakpoint(bda_addr, false);
+        if addr_err {
             self.cop0.bad_vaddr = vaddr;
-            self.raise_exception(ExceptionCode::AddressErrorLoad, 0, false);
+            let ce = ((self.last_opcode >> 26) & 3) as u8;
+            self.raise_exception(ExceptionCode::AddressErrorLoad, ce, false);
             return 0;
         }
-        if self.cop0.check_data_breakpoint(vaddr, false) {
+        if bp_trap {
             self.raise_exception(ExceptionCode::Breakpoint, 0, true);
             return 0;
         }
@@ -676,12 +728,32 @@ impl Cpu {
         G: GpuBackend,
         F: FnOnce(&mut Self, &mut Bus<G>, u32) -> Result<u64, crate::bus::BusError>,
     {
-        if (vaddr & (align - 1)) != 0 || (self.cop0.is_user_mode() && vaddr >= 0x8000_0000) {
+        self.exec_store_bda(bus, vaddr, vaddr, align, f)
+    }
+
+    #[inline]
+    fn exec_store_bda<G, F>(
+        &mut self,
+        bus: &mut Bus<G>,
+        vaddr: u32,
+        bda_addr: u32,
+        align: u32,
+        f: F,
+    ) -> u64
+    where
+        G: GpuBackend,
+        F: FnOnce(&mut Self, &mut Bus<G>, u32) -> Result<u64, crate::bus::BusError>,
+    {
+        let addr_err =
+            (vaddr & (align - 1)) != 0 || (self.cop0.is_user_mode() && vaddr >= 0x8000_0000);
+        let bp_trap = self.cop0.check_data_breakpoint(bda_addr, true);
+        if addr_err {
             self.cop0.bad_vaddr = vaddr;
-            self.raise_exception(ExceptionCode::AddressErrorStore, 0, false);
+            let ce = ((self.last_opcode >> 26) & 3) as u8;
+            self.raise_exception(ExceptionCode::AddressErrorStore, ce, false);
             return 0;
         }
-        if self.cop0.check_data_breakpoint(vaddr, true) {
+        if bp_trap {
             self.raise_exception(ExceptionCode::Breakpoint, 0, true);
             return 0;
         }
@@ -945,5 +1017,176 @@ mod tests {
             (cpu.cop0.cause >> 2) & 0x1F,
             ExceptionCode::ArithmeticOverflow as u32
         );
+    }
+
+    #[test]
+    fn cop0_tar_only_latches_on_branch_delay_exception() {
+        let prog = [
+            0x1000_0001, // 0x8001_0000: beq $zero, $zero, +1 -> target 0x8001_0008
+            0x0000_0000, // 0x8001_0004: nop (normal delay slot)
+            0x1000_0002, // 0x8001_0008: beq $zero, $zero, +2 -> target 0x8001_0014
+            0x0000_000C, // 0x8001_000C: syscall (exception inside branch delay slot!)
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog);
+        cpu.cop0.jumpdest = 0x1234_5678;
+
+        // Normal taken branch + delay slot must NOT overwrite TAR / JUMPDEST
+        cpu.step_instruction(&mut bus);
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8001_0008);
+        assert_eq!(cpu.cop0.jumpdest, 0x1234_5678);
+
+        // Exception inside taken branch delay slot MUST latch TAR, BD, BT, and EPC = branch PC
+        cpu.step_instruction(&mut bus);
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0080);
+        assert_eq!(cpu.cop0.epc, 0x8001_0008);
+        assert_eq!(cpu.cop0.jumpdest, 0x8001_0014);
+        assert_eq!(cpu.cop0.cause & 0xC000_0000, 0xC000_0000); // BD | BT
+    }
+
+    #[test]
+    fn mtc0_sr_delays_irq_by_one_instruction_unlike_mtc0_cause() {
+        // Case A: CAUSE.Sw0 already pending; MTC0 SR enables IEc|IM0 -> next insn runs before IRQ!
+        let prog_sr = [
+            (0x10 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11), // 0x8001_0000: mtc0 $t0, SR
+            0x2409_0042, // 0x8001_0004: addiu $t1, $zero, 0x42 (MUST execute!)
+            0x240A_0099, // 0x8001_0008: addiu $t2, $zero, 0x99 (IRQ fires here!)
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog_sr);
+        cpu.cop0.cause = 0x0000_0100; // Sw0 pending
+        cpu.regs[8] = 0x0000_0101; // IEc | IM0
+
+        cpu.step_instruction(&mut bus); // mtc0 SR
+        cpu.step_instruction(&mut bus); // addiu $t1, 0x42 runs under previous SR!
+        assert_eq!(cpu.regs[9], 0x42);
+        assert_eq!(cpu.pc, 0x8001_0008);
+
+        cpu.step_instruction(&mut bus); // Now IRQ fires with EPC = 0x8001_0008!
+        assert_eq!(cpu.pc, 0x8000_0080);
+        assert_eq!(cpu.cop0.epc, 0x8001_0008);
+        assert_eq!(cpu.regs[10], 0);
+
+        // Case B: SR already has IEc|IM0; MTC0 CAUSE sets Sw0 -> IRQ fires immediately at +4!
+        let prog_cause = [
+            (0x10 << 26) | (0x04 << 21) | (8 << 16) | (13 << 11), // 0x8001_0000: mtc0 $t0, CAUSE
+            0x2409_0042, // 0x8001_0004: addiu $t1, $zero, 0x42 (preempted!)
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog_cause);
+        cpu.cop0.sr = 0x0000_0101;
+        cpu.regs[8] = 0x0000_0100;
+
+        cpu.step_instruction(&mut bus); // mtc0 CAUSE
+        cpu.step_instruction(&mut bus); // IRQ fires immediately!
+        assert_eq!(cpu.pc, 0x8000_0080);
+        assert_eq!(cpu.cop0.epc, 0x8001_0004);
+        assert_eq!(cpu.regs[9], 0);
+    }
+
+    #[test]
+    fn cause_ce_reserved_cop0_regs_and_dcic_lwl_swl_bda() {
+        // 1. Reserved COP0 register r0 raises RI; unimplemented r16 does not
+        let prog_cop0 = [
+            (0x10 << 26) | (8 << 16) | (16 << 11), // mfc0 $t0, $16 (reads 0, no trap)
+            (0x10 << 26) | (8 << 16),              // mfc0 $t0, $0  (reserved TLB reg -> RI!)
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog_cop0);
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8001_0004);
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0080);
+        assert_eq!(
+            (cpu.cop0.cause >> 2) & 0x1F,
+            ExceptionCode::ReservedInstruction as u32
+        );
+
+        // 2. Illegal primary opcode sets CAUSE.CE = op & 3
+        let (mut cpu, mut bus) = setup_code(&[0xF800_0000]); // op = 0x3E -> CE = 2
+        cpu.step_instruction(&mut bus);
+        assert_eq!(
+            (cpu.cop0.cause >> 2) & 0x1F,
+            ExceptionCode::ReservedInstruction as u32
+        );
+        assert_eq!((cpu.cop0.cause >> 28) & 3, 2);
+
+        // 3. Misaligned LW sets CAUSE.CE = 3 AND latches DCIC BDA status bits even when TR = 0
+        let prog_adel = [
+            0x8D09_0001, // lw $t1, 1($t0) -> vaddr 0x8000_2001 (misaligned!)
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog_adel);
+        cpu.regs[8] = 0x8000_2000;
+        cpu.cop0.bda = 0x8000_2001;
+        cpu.cop0.bdam = 0xFFFF_FFFF;
+        // DE(23) | DAE(25) | DR(26) | KD(29), TR(31) = 0
+        cpu.cop0.dcic = (1 << 29) | (1 << 26) | (1 << 25) | (1 << 23);
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0080); // AdEL wins over BDA
+        assert_eq!((cpu.cop0.cause >> 28) & 3, 3); // LW op=0x23 -> CE=3
+        assert_eq!(cpu.cop0.dcic & 0x0D, 0x0D); // Status bits 0, 2, 3 latched!
+
+        // 4. LWL/SWL drive aligned `vaddr & !3` to BDA, whereas LWR/SWR drive exact `vaddr`
+        let prog_unaligned = [
+            0x8909_0003, // lwl $t1, 3($t0) -> BDA sees 0x8000_2000
+            0x9909_0003, // lwr $t1, 3($t0) -> BDA sees 0x8000_2003
+        ];
+        let (mut cpu, mut bus) = setup_code(&prog_unaligned);
+        cpu.regs[8] = 0x8000_2000;
+        cpu.cop0.bda = 0x8000_2003;
+        cpu.cop0.bdam = 0xFFFF_FFFF;
+        cpu.cop0.dcic = (1 << 31) | (1 << 29) | (1 << 26) | (1 << 25) | (1 << 23);
+        cpu.step_instruction(&mut bus); // LWL checks 0x8000_2000 -> no match!
+        assert_eq!(cpu.pc, 0x8001_0004);
+        assert_eq!(cpu.cop0.dcic & 0x1F, 0);
+        cpu.step_instruction(&mut bus); // LWR checks 0x8000_2003 -> debug trap to 0x8000_0040!
+        assert_eq!(cpu.pc, 0x8000_0040);
+        assert_eq!(cpu.cop0.dcic & 0x0D, 0x0D);
+
+        // 5. DCIC UD (bit 30) gates < 0x8000_0000 and must NOT match >= 0x8000_0000
+        let (mut cpu, mut bus) = setup_code(&[0x0000_0000]);
+        cpu.cop0.bpc = 0x8001_0000;
+        cpu.cop0.bpcm = 0xFFFF_FFFF;
+        cpu.cop0.dcic = (1 << 31) | (1 << 30) | (1 << 24) | (1 << 23); // UD only, KD=0
+        cpu.step_instruction(&mut bus);
+        assert_eq!(cpu.pc, 0x8001_0004);
+        assert_eq!(cpu.cop0.dcic & 0x03, 0);
+    }
+
+    #[test]
+    fn gte_async_pipeline_stall_matches_hardware_cycle_cadence() {
+        let sqr_cmd = (0x12 << 26) | (1 << 25) | 0x28; // SQR (5-cycle GTE latency)
+        let mfc2_ir1 = (0x12 << 26) | (8 << 16) | (9 << 11); // mfc2 $t0, IR1
+
+        let measure = |nops: usize| -> u64 {
+            let mut prog = alloc::vec::Vec::with_capacity(nops + 2);
+            prog.push(sqr_cmd);
+            prog.extend(core::iter::repeat_n(0x0000_0000, nops));
+            prog.push(mfc2_ir1);
+
+            let (mut cpu, mut bus) = setup_code(&prog);
+            // Enable I-Cache and run once to warm cache lines, then measure cached execution
+            bus.write32(0xFFFE_0130, 1 << 11).unwrap();
+            for _ in 0..prog.len() {
+                cpu.step_instruction(&mut bus);
+            }
+            cpu.pc = 0x8001_0000;
+            cpu.next_pc = 0x8001_0004;
+            cpu.cycle_count = 1000;
+            cpu.gte_busy_until = 0;
+
+            let mut total = 0u64;
+            for _ in 0..prog.len() {
+                total += cpu.step_instruction(&mut bus);
+            }
+            total
+        };
+
+        // 0 NOPs: SQR(1) + MFC2(1 + (5-1)+1 = 6) = 7 cycles
+        assert_eq!(measure(0), 7);
+        // 1 NOP: SQR(1) + NOP(1) + MFC2(1 + (5-2)+1 = 5) = 7 cycles
+        assert_eq!(measure(1), 7);
+        // 3 NOPs: SQR(1) + 3*NOP(3) + MFC2(1 + (5-4)+1 = 3) = 7 cycles
+        assert_eq!(measure(3), 7);
+        // 4 NOPs: SQR(1) + 4*NOP(4) + MFC2(1 + 0 stall) = 6 cycles (hardware +1 stall release bubble!)
+        assert_eq!(measure(4), 6);
     }
 }

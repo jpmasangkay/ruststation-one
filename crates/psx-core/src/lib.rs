@@ -10,7 +10,7 @@ pub mod gte;
 pub mod scheduler;
 pub mod system;
 
-pub use bus::{Bus, BusError, GpuBackend, NullGpu};
+pub use bus::{Bus, BusError, GpuBackend, NullGpu, pad_buttons};
 pub use cpu::Cpu;
 pub use exe::PsxExe;
 pub use gte::Gte;

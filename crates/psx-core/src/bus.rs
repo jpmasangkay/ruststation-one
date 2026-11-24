@@ -165,6 +165,124 @@ struct TimerRegs {
     last_sync_cycle: u64,
 }
 
+/// Standard PS1 Digital Pad (`0x5A41`) button bitmasks (active-high helper constants;
+/// `Sio0Pad` inverts them to PS1 active-low wire format).
+pub mod pad_buttons {
+    pub const SELECT: u16 = 1 << 0;
+    pub const START: u16 = 1 << 3;
+    pub const UP: u16 = 1 << 4;
+    pub const RIGHT: u16 = 1 << 5;
+    pub const DOWN: u16 = 1 << 6;
+    pub const LEFT: u16 = 1 << 7;
+    pub const L2: u16 = 1 << 8;
+    pub const R2: u16 = 1 << 9;
+    pub const L1: u16 = 1 << 10;
+    pub const R1: u16 = 1 << 11;
+    pub const TRIANGLE: u16 = 1 << 12;
+    pub const CIRCLE: u16 = 1 << 13;
+    pub const CROSS: u16 = 1 << 14;
+    pub const SQUARE: u16 = 1 << 15;
+}
+
+/// Phase 1 `SIO0` Controller Port 1 Digital Pad (`0x5A41`) SPI state machine.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Sio0Pad {
+    /// Active-high pressed button mask (`0` = no buttons pressed).
+    pressed_mask: u16,
+    ctrl: u16,
+    mode: u16,
+    baud: u16,
+    stage: u8,
+    rx_byte: u8,
+    rx_ready: bool,
+    irq_flag: bool,
+    ack_active_until: u64,
+    schedule_ack_irq: bool,
+}
+
+impl Sio0Pad {
+    fn status(&self, now_cycle: u64) -> u16 {
+        let mut st = 0x0005u16; // TX_RDY1 | TX_RDY2
+        if self.rx_ready {
+            st |= 1 << 1; // RX FIFO Not Empty
+        }
+        if now_cycle < self.ack_active_until {
+            st |= 1 << 7; // /ACK Input Level (active low on wire -> reads 1 when asserted)
+        }
+        if self.irq_flag {
+            st |= 1 << 9; // Interrupt Request
+        }
+        st
+    }
+
+    fn read_rx(&mut self) -> u8 {
+        self.rx_ready = false;
+        self.rx_byte
+    }
+
+    fn write_ctrl(&mut self, val: u16) {
+        if (val & 0x0010) != 0 {
+            self.irq_flag = false; // Acknowledge
+        }
+        if (val & 0x0040) != 0 || (val & 0x0002) == 0 {
+            // Reset or /CS deasserted -> return pad transaction to idle
+            self.stage = 0;
+            self.rx_ready = false;
+            self.ack_active_until = 0;
+        }
+        self.ctrl = val & !0x0050;
+    }
+
+    fn write_tx(&mut self, val: u8, now_cycle: u64) {
+        let active_low = !self.pressed_mask;
+        let port1_selected = (self.ctrl & 0x2002) == 0x0002;
+
+        let (reply, do_ack) = if !port1_selected {
+            self.stage = 0;
+            (0xFF, false)
+        } else {
+            match self.stage {
+                0 if val == 0x01 => {
+                    self.stage = 1;
+                    (0xFF, true)
+                }
+                1 if val == 0x42 => {
+                    self.stage = 2;
+                    (0x41, true) // Digital Pad ID low byte
+                }
+                2 => {
+                    self.stage = 3;
+                    (0x5A, true) // Ready byte
+                }
+                3 => {
+                    self.stage = 4;
+                    ((active_low & 0xFF) as u8, true)
+                }
+                4 => {
+                    self.stage = 0;
+                    (((active_low >> 8) & 0xFF) as u8, false)
+                }
+                _ => {
+                    self.stage = 0;
+                    (0xFF, false)
+                }
+            }
+        };
+
+        self.rx_byte = reply;
+        self.rx_ready = true;
+        if do_ack {
+            self.ack_active_until = now_cycle.saturating_add(400);
+            if (self.ctrl & 0x1000) != 0 {
+                self.irq_flag = true;
+                self.schedule_ack_irq = true;
+            }
+        } else {
+            self.ack_active_until = 0;
+        }
+    }
+}
+
 /// Phase 1 CD-ROM stub supporting index banking and basic status/FIFO queries for BIOS boot.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CdRomStub {
@@ -231,12 +349,20 @@ impl CdRomStub {
     }
 }
 
+/// Allocates a zeroed fixed-size byte array directly on the heap without touching the stack.
+fn alloc_boxed_bytes<const N: usize>() -> Box<[u8; N]> {
+    match vec![0u8; N].into_boxed_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => unreachable!("allocated slice length always matches N"),
+    }
+}
+
 /// Physical PS1 Memory & MMIO Bus.
 pub struct Bus<G: GpuBackend = NullGpu> {
-    ram: Box<[u8]>,
+    ram: Box<[u8; RAM_BYTES]>,
     scratchpad: [u8; SCRATCHPAD_BYTES],
-    bios: Box<[u8]>,
-    spu_mmio: Box<[u8]>,
+    bios: Box<[u8; BIOS_BYTES]>,
+    spu_mmio: Box<[u8; SPU_MMIO_BYTES]>,
 
     /// `0x1F80_1000..=0x1F80_1020` Memory Control 1 & 2.
     memctrl: [u32; 9],
@@ -258,8 +384,9 @@ pub struct Bus<G: GpuBackend = NullGpu> {
     /// 3 Root Counters (`0x1F80_1100..=0x1F80_112F`).
     timers: [TimerRegs; 3],
 
-    /// `SIO0` / `SIO1` stub registers (`0x1F80_1040..=0x1F80_105F`).
-    sio_regs: [u16; 16],
+    /// `SIO0` Digital Pad controller + `SIO1` stub registers (`0x1F80_1040..=0x1F80_105F`).
+    sio0: Sio0Pad,
+    sio1_regs: [u16; 8],
 
     /// CD-ROM stub (`0x1F80_1800..=0x1F80_1803`).
     cdrom: CdRomStub,
@@ -283,15 +410,15 @@ pub struct Bus<G: GpuBackend = NullGpu> {
 impl<G: GpuBackend> Bus<G> {
     #[must_use]
     pub fn new(gpu: G) -> Self {
-        let mut bios = vec![0u8; BIOS_BYTES].into_boxed_slice();
+        let mut bios = alloc_boxed_bytes::<BIOS_BYTES>();
         // Default reset stub (`j 0xBFC0_0000; nop`) so an empty bus loops safely unless BIOS loaded
         bios[0..4].copy_from_slice(&0x0BF0_0000u32.to_le_bytes());
 
         Self {
-            ram: vec![0u8; RAM_BYTES].into_boxed_slice(),
+            ram: alloc_boxed_bytes::<RAM_BYTES>(),
             scratchpad: [0u8; SCRATCHPAD_BYTES],
             bios,
-            spu_mmio: vec![0u8; SPU_MMIO_BYTES].into_boxed_slice(),
+            spu_mmio: alloc_boxed_bytes::<SPU_MMIO_BYTES>(),
             memctrl: [
                 0x1F00_0000,
                 0x1F80_2000,
@@ -311,7 +438,8 @@ impl<G: GpuBackend> Bus<G> {
             dma_dpcr: 0x0765_4321,
             dma_dicr: 0,
             timers: [TimerRegs::default(); 3],
-            sio_regs: [0; 16],
+            sio0: Sio0Pad::default(),
+            sio1_regs: [0; 8],
             cdrom: CdRomStub::default(),
             mdec_status: 0x8004_0000, // FIFO empty, not busy
             post_code: 0,
@@ -374,22 +502,51 @@ impl<G: GpuBackend> Bus<G> {
         self.post_code
     }
 
+    /// Sets the active-high button mask (`pad_buttons::*`) for Controller Port 1 (`SIO0`).
+    #[inline(always)]
+    pub fn set_pad_buttons(&mut self, pressed_mask: u16) {
+        self.sio0.pressed_mask = pressed_mask;
+    }
+
+    /// Consumes a pending request from `SIO0` to schedule `EventKind::Sio0AckIrq` (`IRQ7`).
+    #[inline(always)]
+    pub fn take_sio0_irq_request(&mut self) -> bool {
+        if self.sio0.schedule_ack_irq {
+            self.sio0.schedule_ack_irq = false;
+            true
+        } else {
+            false
+        }
+    }
+
     #[inline(always)]
     #[must_use]
     pub fn ram(&self) -> &[u8] {
-        &self.ram
+        self.ram.as_slice()
     }
 
     #[inline(always)]
     #[must_use]
     pub fn ram_mut(&mut self) -> &mut [u8] {
-        &mut self.ram
+        self.ram.as_mut_slice()
     }
 
     #[inline(always)]
     #[must_use]
     pub fn scratchpad(&self) -> &[u8; SCRATCHPAD_BYTES] {
         &self.scratchpad
+    }
+
+    #[inline(always)]
+    #[must_use]
+    pub fn scratchpad_mut(&mut self) -> &mut [u8; SCRATCHPAD_BYTES] {
+        &mut self.scratchpad
+    }
+
+    #[inline(always)]
+    #[must_use]
+    pub const fn has_exp2_tty(&self) -> bool {
+        self.exp2_tty_len != 0
     }
 
     pub fn drain_exp2_tty(&mut self) -> ([u8; 64], usize) {
@@ -726,8 +883,11 @@ impl<G: GpuBackend> Bus<G> {
 
     fn read_mmio8(&mut self, phys: u32) -> u8 {
         match phys {
-            // SIO0 / SIO1
-            0x1F80_1040 | 0x1F80_1050 => 0xFF, // No pad / card response
+            // SIO0 Controller Port (`0x1F80_1040..=0x1F80_104F`)
+            0x1F80_1040 => self.sio0.read_rx(),
+            0x1F80_1041..=0x1F80_1043 => 0xFF,
+            // SIO1 Serial Port stub
+            0x1F80_1050 => 0xFF,
             0x1F80_1044..=0x1F80_105F => {
                 let half = self.read_mmio16(phys & !1);
                 ((half >> ((phys & 1) * 8)) & 0xFF) as u8
@@ -757,11 +917,19 @@ impl<G: GpuBackend> Bus<G> {
 
     fn read_mmio16(&mut self, phys: u32) -> u16 {
         match phys {
-            0x1F80_1040 | 0x1F80_1050 => 0xFFFF,
-            0x1F80_1044 | 0x1F80_1054 => 0x0005, // TX_RDY1 | TX_RDY2
-            0x1F80_1048..=0x1F80_105E => {
-                let idx = ((phys - 0x1F80_1040) >> 1) as usize;
-                self.sio_regs[idx]
+            // SIO0 Controller Port (`0x1F80_1040..=0x1F80_104E`)
+            0x1F80_1040 => (self.sio0.read_rx() as u16) | 0xFF00,
+            0x1F80_1044 => self.sio0.status(self.clock_cycle),
+            0x1F80_1048 => self.sio0.mode,
+            0x1F80_104A => self.sio0.ctrl,
+            0x1F80_104E => self.sio0.baud,
+            0x1F80_1042 | 0x1F80_1046 | 0x1F80_104C => 0,
+            // SIO1 stub
+            0x1F80_1050 => 0xFFFF,
+            0x1F80_1054 => 0x0005, // TX_RDY1 | TX_RDY2
+            0x1F80_1052 | 0x1F80_1056..=0x1F80_105E => {
+                let idx = ((phys - 0x1F80_1050) >> 1) as usize;
+                self.sio1_regs[idx]
             }
             0x1F80_1070 => self.i_stat,
             0x1F80_1074 => self.i_mask,
@@ -782,6 +950,8 @@ impl<G: GpuBackend> Bus<G> {
     fn read_mmio32(&mut self, phys: u32) -> u32 {
         match phys {
             0x1F80_1000..=0x1F80_1020 => self.memctrl[((phys - 0x1F80_1000) >> 2) as usize],
+            0x1F80_1040 => (self.sio0.read_rx() as u32) | 0xFFFF_FF00,
+            0x1F80_1044 => self.sio0.status(self.clock_cycle) as u32,
             0x1F80_1060 => self.ram_size_reg,
             0x1F80_1070 => self.i_stat as u32,
             0x1F80_1074 => self.i_mask as u32,
@@ -813,7 +983,8 @@ impl<G: GpuBackend> Bus<G> {
 
     fn write_mmio8(&mut self, phys: u32, val: u8) {
         match phys {
-            0x1F80_1040..=0x1F80_105F => {
+            0x1F80_1040 => self.sio0.write_tx(val, self.clock_cycle),
+            0x1F80_1041..=0x1F80_105F => {
                 if (phys & 1) == 0 {
                     self.write_mmio16(phys, val as u16);
                 }
@@ -855,9 +1026,14 @@ impl<G: GpuBackend> Bus<G> {
 
     fn write_mmio16(&mut self, phys: u32, val: u16) {
         match phys {
-            0x1F80_1040..=0x1F80_105E => {
-                let idx = ((phys - 0x1F80_1040) >> 1) as usize;
-                self.sio_regs[idx] = val;
+            0x1F80_1040 => self.sio0.write_tx(val as u8, self.clock_cycle),
+            0x1F80_1048 => self.sio0.mode = val,
+            0x1F80_104A => self.sio0.write_ctrl(val),
+            0x1F80_104E => self.sio0.baud = val,
+            0x1F80_1042 | 0x1F80_1044 | 0x1F80_1046 | 0x1F80_104C => {}
+            0x1F80_1050..=0x1F80_105E => {
+                let idx = ((phys - 0x1F80_1050) >> 1) as usize;
+                self.sio1_regs[idx] = val;
             }
             // I_STAT: write-0-to-acknowledge!
             0x1F80_1070 => self.i_stat &= val,
@@ -891,6 +1067,7 @@ impl<G: GpuBackend> Bus<G> {
             0x1F80_1000..=0x1F80_1020 => {
                 self.memctrl[((phys - 0x1F80_1000) >> 2) as usize] = val;
             }
+            0x1F80_1040 => self.sio0.write_tx(val as u8, self.clock_cycle),
             0x1F80_1060 => self.ram_size_reg = val,
             0x1F80_1070 => self.i_stat &= val as u16,
             0x1F80_1074 => self.i_mask = (val as u16) & 0x07FF,
@@ -1165,5 +1342,53 @@ mod tests {
         assert_eq!(bus.read32(0x0000_1008).unwrap().0, 0x0000_1004);
         assert_eq!(bus.read32(0x0000_1004).unwrap().0, 0x0000_1000);
         assert_eq!(bus.read32(0x0000_1000).unwrap().0, 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn sio0_digital_pad_spi_handshake_active_low_and_cs_reset() {
+        let mut bus = Bus::new(NullGpu::new());
+        let pressed = pad_buttons::DOWN | pad_buttons::CROSS;
+        bus.set_pad_buttons(pressed);
+
+        // Select Port 1 (/CS bit 1), TX/RX enable (bits 0,2), ACK IRQ enable (bit 12)
+        bus.write16(0x1F80_104A, 0x1007).unwrap();
+
+        // Byte 0: 0x01 (Controller address) -> 0xFF + /ACK + IRQ7 request
+        bus.write8(0x1F80_1040, 0x01).unwrap();
+        assert!(bus.take_sio0_irq_request());
+        assert_eq!(bus.read16(0x1F80_1044).unwrap().0 & 0x0282, 0x0282);
+        assert_eq!(bus.read8(0x1F80_1040).unwrap().0, 0xFF);
+
+        // Byte 1: 0x42 (Read Pad) -> 0x41 (Digital Pad ID)
+        bus.write16(0x1F80_104A, 0x1017).unwrap(); // Ack IRQ flag
+        bus.write8(0x1F80_1040, 0x42).unwrap();
+        assert!(bus.take_sio0_irq_request());
+        assert_eq!(bus.read8(0x1F80_1040).unwrap().0, 0x41);
+
+        // Byte 2: 0x00 -> 0x5A (Ready)
+        bus.write8(0x1F80_1040, 0x00).unwrap();
+        assert!(bus.take_sio0_irq_request());
+        assert_eq!(bus.read8(0x1F80_1040).unwrap().0, 0x5A);
+
+        // Bytes 3..4: Active-low button mask (no ACK after final byte!)
+        bus.write8(0x1F80_1040, 0x00).unwrap();
+        assert!(bus.take_sio0_irq_request());
+        let lo = bus.read8(0x1F80_1040).unwrap().0;
+
+        bus.write8(0x1F80_1040, 0x00).unwrap();
+        assert!(!bus.take_sio0_irq_request());
+        let hi = bus.read8(0x1F80_1040).unwrap().0;
+
+        let active_low = u16::from_le_bytes([lo, hi]);
+        assert_eq!(!active_low, pressed);
+
+        // Deasserting /CS mid-transaction resets stage back to idle (0)
+        bus.write8(0x1F80_1040, 0x01).unwrap();
+        let _ = bus.take_sio0_irq_request();
+        bus.write16(0x1F80_104A, 0x0000).unwrap(); // /CS high
+        bus.write16(0x1F80_104A, 0x1007).unwrap(); // /CS low again
+        bus.write8(0x1F80_1040, 0x42).unwrap(); // Must NOT reply 0x41 without fresh 0x01!
+        assert!(!bus.take_sio0_irq_request());
+        assert_eq!(bus.read8(0x1F80_1040).unwrap().0, 0xFF);
     }
 }
