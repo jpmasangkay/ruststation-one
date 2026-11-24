@@ -1,0 +1,8 @@
+[package]
+name = "psx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+psx-core.workspace = true

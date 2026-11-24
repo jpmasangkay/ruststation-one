@@ -1,0 +1,12 @@
+/target
+/local
+*.bin
+*.cue
+*.chd
+*.iso
+*.pbp
+*.mcd
+*.mcr
+*.srm
+*.sav
+*.trace
